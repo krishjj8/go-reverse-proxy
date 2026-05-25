@@ -1,0 +1,19 @@
+# Compiled binaries
+/proxy
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Core dumps or local execution builds
+proxy-engine
+
+# IDE configurations
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp

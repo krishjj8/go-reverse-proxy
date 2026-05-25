@@ -1,0 +1,7 @@
+server:
+  listen_address: ":8080"
+routes:
+  api.localhost:
+    upstreams:
+      - "http://localhost:8001"
+      - "http://localhost:8002"
