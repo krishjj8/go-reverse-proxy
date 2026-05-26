@@ -1,24 +1,79 @@
 package proxy
 
 import (
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/krishjj8/go-reverse-proxy/internal/config"
 )
 
+type UpstreamPool struct {
+	all     []string
+	healthy []string
+	counter int
+	mu      sync.RWMutex
+}
+
+func (p *UpstreamPool) Next() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.healthy) == 0 {
+		return ""
+	}
+	target := p.healthy[p.counter%len(p.healthy)]
+	p.counter++
+	return target
+}
+
 type Engine struct {
-	routingTable map[string][]string
+	routingTable map[string]*UpstreamPool
 }
 
 func NewEngine(cfg *config.Config) *Engine {
-	table := make(map[string][]string)
+	table := make(map[string]*UpstreamPool)
 	for host, route := range cfg.Routes {
-		table[host] = route.Upstreams
+		pool := &UpstreamPool{
+			all:     route.Upstreams,
+			healthy: route.Upstreams,
+		}
+		table[host] = pool
+
+		go pool.startHealthCheckLoop()
 	}
 	return &Engine{routingTable: table}
+}
+func (p *UpstreamPool) startHealthCheckLoop() {
+
+	ticker := time.NewTicker(5 * time.Second)
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	for range ticker.C {
+		var liveBackends []string
+
+		for _, upstream := range p.all {
+
+			resp, err := client.Get(upstream + "/")
+
+			if err == nil && resp.StatusCode == http.StatusOK {
+				liveBackends = append(liveBackends, upstream)
+				resp.Body.Close()
+			} else {
+				slog.Warn("Upstream detected as UNHEALTHY", "upstream", upstream, "reason", err)
+			}
+		}
+		p.mu.Lock()
+		p.healthy = liveBackends
+		p.mu.Unlock()
+	}
 }
 
 func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -29,16 +84,20 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		incomingHost = parts[0]
 	}
 
-	upstreams, exists := e.routingTable[incomingHost]
-	if !exists || len(upstreams) == 0 {
+	pool, exists := e.routingTable[incomingHost]
+	if !exists || pool == nil {
 		w.WriteHeader(http.StatusBadGateway)
 		w.Write([]byte("502 Bad Gateway: Host routing destination unmapped.\n"))
 		return
 	}
 
-	targetUpstream := upstreams[0]
+	targetUpstream := pool.Next()
+	if targetUpstream == "" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
 
-	// 1. Parse the target upstream string into a concrete *url.URL structure
+	}
+
 	targetURL, err := url.Parse(targetUpstream)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -46,27 +105,22 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Initialize the production-grade Reverse Proxy configuration engine
 	proxyHandler := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			// Mutate the outbound packet destination fields
+
 			req.URL.Scheme = targetURL.Scheme
 			req.URL.Host = targetURL.Host
 			req.URL.Path = singleJoiningSlash(targetURL.Path, req.URL.Path)
 
-			// Crucial step: Rewrite the top-level Host header string for the backend server
 			req.Host = targetURL.Host
 
-			// 3. Security Sanity Check: Scrub connection-breaking hop-by-hop headers
 			removeHopByHopHeaders(req.Header)
 		},
 	}
 
-	// 4. Trigger the standard library to execute the actual TCP forwarding loop!
 	proxyHandler.ServeHTTP(w, r)
 }
 
-// removeHopByHopHeaders wipes out transport-layer headers that shouldn't pass to backends
 func removeHopByHopHeaders(h http.Header) {
 	hopHeaders := []string{
 		"Connection",
@@ -83,7 +137,6 @@ func removeHopByHopHeaders(h http.Header) {
 	}
 }
 
-// singleJoiningSlash safely cleans up path concatenations (preventing "//some/path" bugs)
 func singleJoiningSlash(a, b string) string {
 	aslash := strings.HasSuffix(a, "/")
 	bslash := strings.HasPrefix(b, "/")
