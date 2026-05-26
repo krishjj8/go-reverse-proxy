@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -11,6 +12,62 @@ import (
 
 	"github.com/krishjj8/go-reverse-proxy/internal/config"
 )
+
+type RetryTransport struct {
+	underlying http.RoundTripper
+	pool       *UpstreamPool
+}
+
+func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	isIdempotent := req.Method == "GET" || req.Method == "HEAD"
+
+	maxAttempts := 1
+	if isIdempotent {
+		maxAttempts = 3
+	}
+
+	var resp *http.Response
+	var err error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			backoff := time.Duration(attempt-1) * 50 * time.Millisecond
+			slog.Warn("Retrying failed request to alternative upstream",
+				"attempt", attempt-1,
+				"backoff_ms", backoff.Milliseconds(),
+				"path", req.URL.Path,
+			)
+			time.Sleep(backoff)
+
+			nextUpstream := t.pool.Next()
+			if nextUpstream == "" {
+				return nil, errors.New("all upstreams exhausted during retry execution loop")
+			}
+
+			nextURL, parseErr := url.Parse(nextUpstream)
+			if parseErr == nil {
+				req.URL.Scheme = nextURL.Scheme
+				req.URL.Host = nextURL.Host
+				req.Host = nextURL.Host
+			}
+		}
+
+		resp, err = t.underlying.RoundTrip(req)
+
+		if err == nil && resp.StatusCode < 500 {
+			return resp, nil
+		}
+
+		if err == nil && resp.StatusCode >= 500 && attempt < maxAttempts {
+			resp.Body.Close()
+		}
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
 
 type UpstreamPool struct {
 	all     []string
@@ -43,26 +100,21 @@ func NewEngine(cfg *config.Config) *Engine {
 			healthy: route.Upstreams,
 		}
 		table[host] = pool
-
 		go pool.startHealthCheckLoop()
 	}
 	return &Engine{routingTable: table}
 }
+
 func (p *UpstreamPool) startHealthCheckLoop() {
-
 	ticker := time.NewTicker(5 * time.Second)
-
 	client := &http.Client{
 		Timeout: 2 * time.Second,
 	}
 
 	for range ticker.C {
 		var liveBackends []string
-
 		for _, upstream := range p.all {
-
 			resp, err := client.Get(upstream + "/")
-
 			if err == nil && resp.StatusCode == http.StatusOK {
 				liveBackends = append(liveBackends, upstream)
 				resp.Body.Close()
@@ -70,6 +122,7 @@ func (p *UpstreamPool) startHealthCheckLoop() {
 				slog.Warn("Upstream detected as UNHEALTHY", "upstream", upstream, "reason", err)
 			}
 		}
+
 		p.mu.Lock()
 		p.healthy = liveBackends
 		p.mu.Unlock()
@@ -95,26 +148,26 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if targetUpstream == "" {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
-
 	}
 
 	targetURL, err := url.Parse(targetUpstream)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("500 Internal Server Error: Malformed upstream target configuration.\n"))
 		return
 	}
 
 	proxyHandler := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-
 			req.URL.Scheme = targetURL.Scheme
 			req.URL.Host = targetURL.Host
 			req.URL.Path = singleJoiningSlash(targetURL.Path, req.URL.Path)
-
 			req.Host = targetURL.Host
-
 			removeHopByHopHeaders(req.Header)
+		},
+		// Inject our custom fault-tolerant retry engine!
+		Transport: &RetryTransport{
+			underlying: http.DefaultTransport, // Fallback to Go's highly tuned network client
+			pool:       pool,
 		},
 	}
 
