@@ -3,7 +3,7 @@ package proxy
 import (
 	"errors"
 	"log/slog"
-	"net" // 1. Imported for custom network dialing tuning
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -37,6 +37,54 @@ func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
 		threshold:       threshold,
 		cooldownWindow:  cooldown,
 		lastStateChange: time.Now(),
+	}
+}
+
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.state == StateOpen {
+
+		if time.Since(cb.lastStateChange) >= cb.cooldownWindow {
+			slog.Info("Circuit breaker shifting to HALF-OPEN canary state. Testing upstream wire.", "cooldown_expired_seconds", cb.cooldownWindow.Seconds())
+			cb.state = StateHalfOpen
+			cb.lastStateChange = time.Now()
+			return true
+		}
+		return false
+	}
+
+	return true
+}
+
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failureCount = 0
+
+	if cb.state == StateHalfOpen {
+		slog.Info("Canary trial request succeeded! Shifting circuit breaker back to CLOSED.")
+		cb.state = StateClosed
+		cb.lastStateChange = time.Now()
+	}
+}
+
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failureCount++
+
+	if cb.state == StateClosed && cb.failureCount >= cb.threshold {
+		slog.Warn("Consecutive failure threshold breached! TRIPPING CIRCUIT BREAKER OPEN.", "failures", cb.failureCount, "threshold", cb.threshold)
+		cb.state = StateOpen
+		cb.lastStateChange = time.Now()
+	} else if cb.state == StateHalfOpen {
+		slog.Warn("Canary check failed while in HALF-OPEN. Resetting cooldown timer and ripping circuit OPEN.")
+		cb.state = StateOpen
+		cb.lastStateChange = time.Now()
 	}
 }
 
@@ -81,8 +129,17 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		resp, err = t.underlying.RoundTrip(req)
 
+		currentUpstream := req.URL.Scheme + "://" + req.URL.Host
+
 		if err == nil && resp.StatusCode < 500 {
+			if breaker, exists := t.pool.breakers[currentUpstream]; exists {
+				breaker.RecordSuccess() // Valid payload received; track success
+			}
 			return resp, nil
+		}
+
+		if breaker, exists := t.pool.breakers[currentUpstream]; exists {
+			breaker.RecordFailure()
 		}
 
 		if err == nil && resp.StatusCode >= 500 && attempt < maxAttempts {
@@ -97,10 +154,11 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 type UpstreamPool struct {
-	all     []string
-	healthy []string
-	counter int
-	mu      sync.RWMutex
+	all      []string
+	healthy  []string
+	breakers map[string]*CircuitBreaker
+	counter  int
+	mu       sync.RWMutex
 }
 
 func (p *UpstreamPool) Next() string {
@@ -110,9 +168,20 @@ func (p *UpstreamPool) Next() string {
 	if len(p.healthy) == 0 {
 		return ""
 	}
-	target := p.healthy[p.counter%len(p.healthy)]
-	p.counter++
-	return target
+
+	for i := 0; i < len(p.healthy); i++ {
+		target := p.healthy[p.counter%len(p.healthy)]
+		p.counter++
+
+		if breaker, exists := p.breakers[target]; exists {
+			if breaker.Allow() {
+				return target
+			}
+		} else {
+			return target
+		}
+	}
+	return ""
 }
 
 type Engine struct {
@@ -121,7 +190,6 @@ type Engine struct {
 }
 
 func NewEngine(cfg *config.Config) *Engine {
-
 	customTransport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -137,9 +205,16 @@ func NewEngine(cfg *config.Config) *Engine {
 
 	table := make(map[string]*UpstreamPool)
 	for host, route := range cfg.Routes {
+		breakers := make(map[string]*CircuitBreaker)
+		for _, upstream := range route.Upstreams {
+			// Initialize each destination breaker boundary setup with 3 failures max and 10s cooldown
+			breakers[upstream] = NewCircuitBreaker(3, 10*time.Second)
+		}
+
 		pool := &UpstreamPool{
-			all:     route.Upstreams,
-			healthy: route.Upstreams,
+			all:      route.Upstreams,
+			healthy:  route.Upstreams,
+			breakers: breakers,
 		}
 		table[host] = pool
 		go pool.startHealthCheckLoop()
@@ -192,7 +267,8 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	targetUpstream := pool.Next()
 	if targetUpstream == "" {
-		w.WriteHeader(http.StatusServiceUnavailable)
+		w.WriteHeader(http.StatusServiceUnavailable) // 503 Service Unavailable if all circuits are tripped
+		w.Write([]byte("503 Service Unavailable: All upstream targets tripped open.\n"))
 		return
 	}
 
