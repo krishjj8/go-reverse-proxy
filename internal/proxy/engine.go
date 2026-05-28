@@ -14,6 +14,32 @@ import (
 	"github.com/krishjj8/go-reverse-proxy/internal/config"
 )
 
+type CircuitState int
+
+const (
+	StateClosed CircuitState = iota
+	StateOpen
+	StateHalfOpen
+)
+
+type CircuitBreaker struct {
+	state           CircuitState
+	failureCount    int
+	threshold       int
+	cooldownWindow  time.Duration
+	lastStateChange time.Time
+	mu              sync.Mutex
+}
+
+func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:           StateClosed,
+		threshold:       threshold,
+		cooldownWindow:  cooldown,
+		lastStateChange: time.Now(),
+	}
+}
+
 type RetryTransport struct {
 	underlying http.RoundTripper
 	pool       *UpstreamPool
