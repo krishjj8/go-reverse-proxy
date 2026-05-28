@@ -3,6 +3,7 @@ package proxy
 import (
 	"errors"
 	"log/slog"
+	"net" // 1. Imported for custom network dialing tuning
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -90,9 +91,24 @@ func (p *UpstreamPool) Next() string {
 
 type Engine struct {
 	routingTable map[string]*UpstreamPool
+	transport    http.RoundTripper
 }
 
 func NewEngine(cfg *config.Config) *Engine {
+
+	customTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	table := make(map[string]*UpstreamPool)
 	for host, route := range cfg.Routes {
 		pool := &UpstreamPool{
@@ -102,7 +118,11 @@ func NewEngine(cfg *config.Config) *Engine {
 		table[host] = pool
 		go pool.startHealthCheckLoop()
 	}
-	return &Engine{routingTable: table}
+
+	return &Engine{
+		routingTable: table,
+		transport:    customTransport,
+	}
 }
 
 func (p *UpstreamPool) startHealthCheckLoop() {
@@ -164,9 +184,8 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			req.Host = targetURL.Host
 			removeHopByHopHeaders(req.Header)
 		},
-		// Inject our custom fault-tolerant retry engine!
 		Transport: &RetryTransport{
-			underlying: http.DefaultTransport, // Fallback to Go's highly tuned network client
+			underlying: e.transport,
 			pool:       pool,
 		},
 	}
