@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/krishjj8/go-reverse-proxy/internal/config"
 	"github.com/krishjj8/go-reverse-proxy/internal/logger"
@@ -10,26 +16,43 @@ import (
 )
 
 func main() {
-	// 1. Fire up our production structured JSON logging matrix
 	logger.InitLogger()
 
-	// 2. Load config settings from disk
 	cfg, err := config.LoadConfig("config.yaml")
 	if err != nil {
-		// slog.Error allows key-value pairing attributes
 		slog.Error("Configuration subsystem boot failure", "error", err)
 		panic(err)
 	}
 
-	// 3. Initialize our custom Reverse Proxy routing engine
 	engine := proxy.NewEngine(cfg)
 
-	slog.Info("Proxy engine boot cycle complete", "bind_address", cfg.Server.ListenAddress)
-
-	// 4. Bind to the network socket
-	err = http.ListenAndServe(cfg.Server.ListenAddress, engine)
-	if err != nil {
-		slog.Error("Network socket bind failure", "error", err)
-		panic(err)
+	server := &http.Server{
+		Addr:         cfg.Server.ListenAddress,
+		Handler:      engine,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
 	}
+
+	go func() {
+		slog.Info("Proxy engine boot cycle complete", "bind_address", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Network socket bind failure", "error", err)
+			panic(err)
+		}
+	}()
+
+	shutdownSignalChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignalChan, os.Interrupt, syscall.SIGTERM)
+
+	caughtSignal := <-shutdownSignalChan
+	slog.Warn("Termination signal intercepted by proxy gateway matrix. Initiating safety procedures.", "signal", caughtSignal.String())
+
+	shutdownContext, cancelCloseWindow := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelCloseWindow()
+
+	if err := server.Shutdown(shutdownContext); err != nil {
+		slog.Error("Server forced shutdown executed due to timeout boundary expiration", "error", err)
+	}
+
+	slog.Info("All user connections completed cleanly. Gateway network perimeter deactivated.")
 }

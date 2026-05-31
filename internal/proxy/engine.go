@@ -14,14 +14,16 @@ import (
 	"github.com/krishjj8/go-reverse-proxy/internal/config"
 )
 
+// CircuitState represents our State Machine boundaries
 type CircuitState int
 
 const (
-	StateClosed CircuitState = iota
-	StateOpen
-	StateHalfOpen
+	StateClosed   CircuitState = iota // 0: Healthy operations
+	StateOpen                         // 1: Tripped open; block traffic
+	StateHalfOpen                     // 2: Canary trial mode
 )
 
+// CircuitBreaker manages dynamic failure tracking metrics for an upstream host
 type CircuitBreaker struct {
 	state           CircuitState
 	failureCount    int
@@ -45,7 +47,6 @@ func (cb *CircuitBreaker) Allow() bool {
 	defer cb.mu.Unlock()
 
 	if cb.state == StateOpen {
-
 		if time.Since(cb.lastStateChange) >= cb.cooldownWindow {
 			slog.Info("Circuit breaker shifting to HALF-OPEN canary state. Testing upstream wire.", "cooldown_expired_seconds", cb.cooldownWindow.Seconds())
 			cb.state = StateHalfOpen
@@ -88,9 +89,11 @@ func (cb *CircuitBreaker) RecordFailure() {
 	}
 }
 
+// RetryTransport handles custom transport interceptor logic with async telemetry
 type RetryTransport struct {
 	underlying http.RoundTripper
 	pool       *UpstreamPool
+	telemetry  *TelemetryEngine // Injected async logging pipeline access
 }
 
 func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -103,6 +106,9 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	var resp *http.Response
 	var err error
+
+	// Start the clock baseline immediately to calculate total routing latency
+	startTime := time.Now()
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
@@ -128,12 +134,21 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		resp, err = t.underlying.RoundTrip(req)
-
 		currentUpstream := req.URL.Scheme + "://" + req.URL.Host
 
+		// Success condition execution pathway
 		if err == nil && resp.StatusCode < 500 {
 			if breaker, exists := t.pool.breakers[currentUpstream]; exists {
-				breaker.RecordSuccess() // Valid payload received; track success
+				breaker.RecordSuccess()
+			}
+
+			// Drop log entry into the buffered queue asynchronously and return instantly
+			t.telemetry.LogQueue <- LogEntry{
+				Timestamp:  time.Now(),
+				Path:       req.URL.Path,
+				TargetHost: currentUpstream,
+				StatusCode: resp.StatusCode,
+				LatencyMs:  time.Since(startTime).Milliseconds(),
 			}
 			return resp, nil
 		}
@@ -145,6 +160,20 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err == nil && resp.StatusCode >= 500 && attempt < maxAttempts {
 			resp.Body.Close()
 		}
+	}
+
+	// Final disaster fallback metric tracker if all retries collapse completely
+	finalStatus := 502
+	if resp != nil {
+		finalStatus = resp.StatusCode
+	}
+
+	t.telemetry.LogQueue <- LogEntry{
+		Timestamp:  time.Now(),
+		Path:       req.URL.Path,
+		TargetHost: req.URL.Scheme + "://" + req.URL.Host,
+		StatusCode: finalStatus,
+		LatencyMs:  time.Since(startTime).Milliseconds(),
 	}
 
 	if err != nil {
@@ -187,6 +216,7 @@ func (p *UpstreamPool) Next() string {
 type Engine struct {
 	routingTable map[string]*UpstreamPool
 	transport    http.RoundTripper
+	telemetry    *TelemetryEngine // Cached global reference for async telemetry drops
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -203,11 +233,13 @@ func NewEngine(cfg *config.Config) *Engine {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
+	// Start up our thread-safe asynchronous logging worker with a 10,000 log slot memory queue capacity
+	telemetryEngine := NewTelemetryEngine(10000)
+
 	table := make(map[string]*UpstreamPool)
 	for host, route := range cfg.Routes {
 		breakers := make(map[string]*CircuitBreaker)
 		for _, upstream := range route.Upstreams {
-			// Initialize each destination breaker boundary setup with 3 failures max and 10s cooldown
 			breakers[upstream] = NewCircuitBreaker(3, 10*time.Second)
 		}
 
@@ -223,6 +255,7 @@ func NewEngine(cfg *config.Config) *Engine {
 	return &Engine{
 		routingTable: table,
 		transport:    customTransport,
+		telemetry:    telemetryEngine, // Save reference in the instantiated proxy structural context
 	}
 }
 
@@ -267,7 +300,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	targetUpstream := pool.Next()
 	if targetUpstream == "" {
-		w.WriteHeader(http.StatusServiceUnavailable) // 503 Service Unavailable if all circuits are tripped
+		w.WriteHeader(http.StatusServiceUnavailable)
 		w.Write([]byte("503 Service Unavailable: All upstream targets tripped open.\n"))
 		return
 	}
@@ -289,6 +322,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport: &RetryTransport{
 			underlying: e.transport,
 			pool:       pool,
+			telemetry:  e.telemetry, // Map the telemetry pipeline right to our transport line worker
 		},
 	}
 
