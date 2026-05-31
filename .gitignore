@@ -16,4 +16,9 @@ proxy-engine
 *.ntvs*
 *.njsproj
 *.sln
-*.swp
+*.swp# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+.terraform.lock.hcl
