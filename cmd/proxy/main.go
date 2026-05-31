@@ -25,10 +25,11 @@ func main() {
 	}
 
 	engine := proxy.NewEngine(cfg)
+	limiter := proxy.NewRateLimiter(10, 20)
 
 	server := &http.Server{
 		Addr:         cfg.Server.ListenAddress,
-		Handler:      engine,
+		Handler:      limiter.Middleware(engine),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}
