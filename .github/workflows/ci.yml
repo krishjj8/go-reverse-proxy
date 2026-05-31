@@ -81,4 +81,4 @@ jobs:
     - name: Verify proxy responding
       run: |
         sleep 5
-        curl -f -H "Host: api.proxy" http://${{ secrets.EC2_HOST }}:8080/get
+        curl -f -H "Host: api.proxy" http://${{ secrets.EC2_HOST }}:8080/
