@@ -1,4 +1,4 @@
-name: Continuous Integration
+name: CI/CD Pipeline
 
 on:
   push:
@@ -14,23 +14,66 @@ jobs:
     - name: Checkout Source Code
       uses: actions/checkout@v4
 
-    - name: Initialize Go Toolchain Environment
+    - name: Initialize Go Toolchain
       uses: actions/setup-go@v5
       with:
         go-version: '1.24'
         cache: true
 
-    - name: Verify Dependencies Integrity
+    - name: Verify Dependencies
       run: go mod download && go mod verify
 
-    - name: Execute Source Code Formatting Check
+    - name: Check Formatting
       run: |
         if [ -n "$(gofmt -l .)" ]; then
-          echo "The following files are not properly formatted according to gofmt standards:"
+          echo "Files not formatted:"
           gofmt -l .
           exit 1
         fi
 
-    - name: Compile Application Binary Executables
+    - name: Build Linux Binary
       run: |
-        go build -v ./cmd/proxy/...
+        GOOS=linux GOARCH=amd64 go build -o proxy-binary ./cmd/proxy/...
+
+    - name: Upload Binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: proxy-binary
+        path: proxy-binary
+
+  deploy:
+    needs: validate-and-build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+    - name: Checkout Source Code
+      uses: actions/checkout@v4
+
+    - name: Download Binary
+      uses: actions/download-artifact@v4
+      with:
+        name: proxy-binary
+
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+    - name: Copy files to EC2
+      run: |
+        chmod +x proxy-binary
+        scp -i ~/.ssh/deploy_key proxy-binary ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/proxy/proxy
+        scp -i ~/.ssh/deploy_key config.yaml ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/proxy/config.yaml
+
+    - name: Start proxy service
+      run: |
+        ssh -i ~/.ssh/deploy_key ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
+          "sudo chmod +x /opt/proxy/proxy && sudo systemctl restart go-proxy && sudo systemctl status go-proxy"
+
+    - name: Verify proxy responding
+      run: |
+        sleep 5
+        curl -f -H "Host: api.proxy" http://${{ secrets.EC2_HOST }}:8080/get

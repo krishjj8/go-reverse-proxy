@@ -1,7 +1,7 @@
 server:
   listen_address: ":8080"
+
 routes:
-  api.localhost:
+  api.proxy:
     upstreams:
-      - "http://localhost:8001"
-      - "http://localhost:8002"
+      - "https://httpbin.org"
