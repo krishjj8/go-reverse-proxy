@@ -1,0 +1,36 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Source Code
+      uses: actions/checkout@v4
+
+    - name: Initialize Go Toolchain Environment
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24'
+        cache: true
+
+    - name: Verify Dependencies Integrity
+      run: go mod download && go mod verify
+
+    - name: Execute Source Code Formatting Check
+      run: |
+        if [ -n "$(gofmt -l .)" ]; then
+          echo "The following files are not properly formatted according to gofmt standards:"
+          gofmt -l .
+          exit 1
+        fi
+
+    - name: Compile Application Binary Executables
+      run: |
+        go build -v ./cmd/proxy/...
