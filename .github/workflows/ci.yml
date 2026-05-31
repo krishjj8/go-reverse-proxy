@@ -65,13 +65,18 @@ jobs:
     - name: Copy files to EC2
       run: |
         chmod +x proxy-binary
-        scp -i ~/.ssh/deploy_key proxy-binary ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/proxy/proxy
-        scp -i ~/.ssh/deploy_key config.yaml ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/proxy/config.yaml
+        scp -i ~/.ssh/deploy_key proxy-binary ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/proxy-binary
+        scp -i ~/.ssh/deploy_key config.yaml ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/config.yaml
 
     - name: Start proxy service
       run: |
         ssh -i ~/.ssh/deploy_key ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
-          "sudo chmod +x /opt/proxy/proxy && sudo systemctl restart go-proxy && sudo systemctl status go-proxy"
+          "sudo mkdir -p /opt/proxy && \
+           sudo mv ~/proxy-binary /opt/proxy/proxy && \
+           sudo mv ~/config.yaml /opt/proxy/config.yaml && \
+           sudo chmod +x /opt/proxy/proxy && \
+           sudo systemctl restart go-proxy && \
+           sudo systemctl status go-proxy"
 
     - name: Verify proxy responding
       run: |
