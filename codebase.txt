@@ -1,0 +1,836 @@
+=== MY REVERSE PROXY CODEBASE ===
+
+
+================================================
+FILE: ./cmd/proxy/main.go
+================================================
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/krishjj8/go-reverse-proxy/internal/config"
+	"github.com/krishjj8/go-reverse-proxy/internal/logger"
+	"github.com/krishjj8/go-reverse-proxy/internal/proxy"
+)
+
+func main() {
+	logger.InitLogger()
+
+	cfg, err := config.LoadConfig("config.yaml")
+	if err != nil {
+		slog.Error("Configuration subsystem boot failure", "error", err)
+		panic(err)
+	}
+
+	engine := proxy.NewEngine(cfg)
+
+	server := &http.Server{
+		Addr:         cfg.Server.ListenAddress,
+		Handler:      engine,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+	}
+
+	go func() {
+		slog.Info("Proxy engine boot cycle complete", "bind_address", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Network socket bind failure", "error", err)
+			panic(err)
+		}
+	}()
+
+	shutdownSignalChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignalChan, os.Interrupt, syscall.SIGTERM)
+
+	caughtSignal := <-shutdownSignalChan
+	slog.Warn("Termination signal intercepted by proxy gateway matrix. Initiating safety procedures.", "signal", caughtSignal.String())
+
+	shutdownContext, cancelCloseWindow := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelCloseWindow()
+
+	if err := server.Shutdown(shutdownContext); err != nil {
+		slog.Error("Server forced shutdown executed due to timeout boundary expiration", "error", err)
+	}
+
+	slog.Info("All user connections completed cleanly. Gateway network perimeter deactivated.")
+}
+
+
+================================================
+FILE: ./internal/proxy/engine.go
+================================================
+package proxy
+
+import (
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/krishjj8/go-reverse-proxy/internal/config"
+)
+
+// CircuitState represents our State Machine boundaries
+type CircuitState int
+
+const (
+	StateClosed   CircuitState = iota // 0: Healthy operations
+	StateOpen                         // 1: Tripped open; block traffic
+	StateHalfOpen                     // 2: Canary trial mode
+)
+
+// CircuitBreaker manages dynamic failure tracking metrics for an upstream host
+type CircuitBreaker struct {
+	state           CircuitState
+	failureCount    int
+	threshold       int
+	cooldownWindow  time.Duration
+	lastStateChange time.Time
+	mu              sync.Mutex
+}
+
+func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:           StateClosed,
+		threshold:       threshold,
+		cooldownWindow:  cooldown,
+		lastStateChange: time.Now(),
+	}
+}
+
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.state == StateOpen {
+		if time.Since(cb.lastStateChange) >= cb.cooldownWindow {
+			slog.Info("Circuit breaker shifting to HALF-OPEN canary state. Testing upstream wire.", "cooldown_expired_seconds", cb.cooldownWindow.Seconds())
+			cb.state = StateHalfOpen
+			cb.lastStateChange = time.Now()
+			return true
+		}
+		return false
+	}
+
+	return true
+}
+
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failureCount = 0
+
+	if cb.state == StateHalfOpen {
+		slog.Info("Canary trial request succeeded! Shifting circuit breaker back to CLOSED.")
+		cb.state = StateClosed
+		cb.lastStateChange = time.Now()
+	}
+}
+
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failureCount++
+
+	if cb.state == StateClosed && cb.failureCount >= cb.threshold {
+		slog.Warn("Consecutive failure threshold breached! TRIPPING CIRCUIT BREAKER OPEN.", "failures", cb.failureCount, "threshold", cb.threshold)
+		cb.state = StateOpen
+		cb.lastStateChange = time.Now()
+	} else if cb.state == StateHalfOpen {
+		slog.Warn("Canary check failed while in HALF-OPEN. Resetting cooldown timer and ripping circuit OPEN.")
+		cb.state = StateOpen
+		cb.lastStateChange = time.Now()
+	}
+}
+
+// RetryTransport handles custom transport interceptor logic with async telemetry
+type RetryTransport struct {
+	underlying http.RoundTripper
+	pool       *UpstreamPool
+	telemetry  *TelemetryEngine // Injected async logging pipeline access
+}
+
+func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	isIdempotent := req.Method == "GET" || req.Method == "HEAD"
+
+	maxAttempts := 1
+	if isIdempotent {
+		maxAttempts = 3
+	}
+
+	var resp *http.Response
+	var err error
+
+	// Start the clock baseline immediately to calculate total routing latency
+	startTime := time.Now()
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			backoff := time.Duration(attempt-1) * 50 * time.Millisecond
+			slog.Warn("Retrying failed request to alternative upstream",
+				"attempt", attempt-1,
+				"backoff_ms", backoff.Milliseconds(),
+				"path", req.URL.Path,
+			)
+			time.Sleep(backoff)
+
+			nextUpstream := t.pool.Next()
+			if nextUpstream == "" {
+				return nil, errors.New("all upstreams exhausted during retry execution loop")
+			}
+
+			nextURL, parseErr := url.Parse(nextUpstream)
+			if parseErr == nil {
+				req.URL.Scheme = nextURL.Scheme
+				req.URL.Host = nextURL.Host
+				req.Host = nextURL.Host
+			}
+		}
+
+		resp, err = t.underlying.RoundTrip(req)
+		currentUpstream := req.URL.Scheme + "://" + req.URL.Host
+
+		// Success condition execution pathway
+		if err == nil && resp.StatusCode < 500 {
+			if breaker, exists := t.pool.breakers[currentUpstream]; exists {
+				breaker.RecordSuccess()
+			}
+
+			// Drop log entry into the buffered queue asynchronously and return instantly
+			t.telemetry.LogQueue <- LogEntry{
+				Timestamp:  time.Now(),
+				Path:       req.URL.Path,
+				TargetHost: currentUpstream,
+				StatusCode: resp.StatusCode,
+				LatencyMs:  time.Since(startTime).Milliseconds(),
+			}
+			return resp, nil
+		}
+
+		if breaker, exists := t.pool.breakers[currentUpstream]; exists {
+			breaker.RecordFailure()
+		}
+
+		if err == nil && resp.StatusCode >= 500 && attempt < maxAttempts {
+			resp.Body.Close()
+		}
+	}
+
+	// Final disaster fallback metric tracker if all retries collapse completely
+	finalStatus := 502
+	if resp != nil {
+		finalStatus = resp.StatusCode
+	}
+
+	t.telemetry.LogQueue <- LogEntry{
+		Timestamp:  time.Now(),
+		Path:       req.URL.Path,
+		TargetHost: req.URL.Scheme + "://" + req.URL.Host,
+		StatusCode: finalStatus,
+		LatencyMs:  time.Since(startTime).Milliseconds(),
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+type UpstreamPool struct {
+	all      []string
+	healthy  []string
+	breakers map[string]*CircuitBreaker
+	counter  int
+	mu       sync.RWMutex
+}
+
+func (p *UpstreamPool) Next() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.healthy) == 0 {
+		return ""
+	}
+
+	for i := 0; i < len(p.healthy); i++ {
+		target := p.healthy[p.counter%len(p.healthy)]
+		p.counter++
+
+		if breaker, exists := p.breakers[target]; exists {
+			if breaker.Allow() {
+				return target
+			}
+		} else {
+			return target
+		}
+	}
+	return ""
+}
+
+type Engine struct {
+	routingTable map[string]*UpstreamPool
+	transport    http.RoundTripper
+	telemetry    *TelemetryEngine // Cached global reference for async telemetry drops
+}
+
+func NewEngine(cfg *config.Config) *Engine {
+	customTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// Start up our thread-safe asynchronous logging worker with a 10,000 log slot memory queue capacity
+	telemetryEngine := NewTelemetryEngine(10000)
+
+	table := make(map[string]*UpstreamPool)
+	for host, route := range cfg.Routes {
+		breakers := make(map[string]*CircuitBreaker)
+		for _, upstream := range route.Upstreams {
+			breakers[upstream] = NewCircuitBreaker(3, 10*time.Second)
+		}
+
+		pool := &UpstreamPool{
+			all:      route.Upstreams,
+			healthy:  route.Upstreams,
+			breakers: breakers,
+		}
+		table[host] = pool
+		go pool.startHealthCheckLoop()
+	}
+
+	return &Engine{
+		routingTable: table,
+		transport:    customTransport,
+		telemetry:    telemetryEngine, // Save reference in the instantiated proxy structural context
+	}
+}
+
+func (p *UpstreamPool) startHealthCheckLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	for range ticker.C {
+		var liveBackends []string
+		for _, upstream := range p.all {
+			resp, err := client.Get(upstream + "/")
+			if err == nil && resp.StatusCode == http.StatusOK {
+				liveBackends = append(liveBackends, upstream)
+				resp.Body.Close()
+			} else {
+				slog.Warn("Upstream detected as UNHEALTHY", "upstream", upstream, "reason", err)
+			}
+		}
+
+		p.mu.Lock()
+		p.healthy = liveBackends
+		p.mu.Unlock()
+	}
+}
+
+func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	incomingHost := r.Host
+
+	if strings.Contains(incomingHost, ":") {
+		parts := strings.Split(incomingHost, ":")
+		incomingHost = parts[0]
+	}
+
+	pool, exists := e.routingTable[incomingHost]
+	if !exists || pool == nil {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte("502 Bad Gateway: Host routing destination unmapped.\n"))
+		return
+	}
+
+	targetUpstream := pool.Next()
+	if targetUpstream == "" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("503 Service Unavailable: All upstream targets tripped open.\n"))
+		return
+	}
+
+	targetURL, err := url.Parse(targetUpstream)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	proxyHandler := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = targetURL.Scheme
+			req.URL.Host = targetURL.Host
+			req.URL.Path = singleJoiningSlash(targetURL.Path, req.URL.Path)
+			req.Host = targetURL.Host
+			removeHopByHopHeaders(req.Header)
+		},
+		Transport: &RetryTransport{
+			underlying: e.transport,
+			pool:       pool,
+			telemetry:  e.telemetry, // Map the telemetry pipeline right to our transport line worker
+		},
+	}
+
+	proxyHandler.ServeHTTP(w, r)
+}
+
+func removeHopByHopHeaders(h http.Header) {
+	hopHeaders := []string{
+		"Connection",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"TE",
+		"Trailers",
+		"Transfer-Encoding",
+		"Upgrade",
+	}
+	for _, header := range hopHeaders {
+		h.Del(header)
+	}
+}
+
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + b
+	}
+	return a + "/" + b
+}
+
+
+================================================
+FILE: ./internal/proxy/telemetry.go
+================================================
+package proxy
+
+import (
+	"log/slog"
+	"time"
+)
+
+type LogEntry struct {
+	Timestamp  time.Time `json:"timestamp"`
+	Path       string    `json:"path"`
+	TargetHost string    `json:"target_host"`
+	StatusCode int       `json:"status_code"`
+	LatencyMs  int64     `json:"latency_ms"`
+}
+
+type TelemetryEngine struct {
+	LogQueue chan LogEntry
+	metrics  *CloudWatchMetrics
+}
+
+func NewTelemetryEngine(bufferSize int) *TelemetryEngine {
+	engine := &TelemetryEngine{
+		LogQueue: make(chan LogEntry, bufferSize),
+		metrics:  NewCloudWatchMetrics("ReverseProxyGateway"),
+	}
+
+	go engine.startLogConsumer()
+
+	return engine
+}
+
+func (te *TelemetryEngine) startLogConsumer() {
+	slog.Info("Asynchronous cloud telemetry background worker initialized cleanly.")
+
+	for entry := range te.LogQueue {
+		slog.Info("Telemetry event dispatched asynchronously",
+			"path", entry.Path,
+			"target", entry.TargetHost,
+			"status", entry.StatusCode,
+			"latency_ms", entry.LatencyMs,
+		)
+
+		// Stream the structural data to AWS CloudWatch asynchronously out of the hot path
+		te.metrics.RecordLatency(entry.TargetHost, float64(entry.LatencyMs))
+	}
+}
+
+
+================================================
+FILE: ./internal/proxy/metrics.go
+================================================
+package proxy
+
+import (
+	"context"
+	"log/slog"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
+)
+
+type CloudWatchMetrics struct {
+	client    *cloudwatch.Client
+	namespace string
+}
+
+func NewCloudWatchMetrics(namespace string) *CloudWatchMetrics {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		slog.Warn("AWS SDK default configuration load failed. Falling back to local logging mode.", "error", err)
+		return &CloudWatchMetrics{client: nil, namespace: namespace}
+	}
+
+	return &CloudWatchMetrics{
+		client:    cloudwatch.NewFromConfig(cfg),
+		namespace: namespace,
+	}
+}
+
+func (m *CloudWatchMetrics) RecordLatency(upstream string, latencyMs float64) {
+	if m.client == nil {
+		return
+	}
+
+	_, err := m.client.PutMetricData(context.TODO(), &cloudwatch.PutMetricDataInput{
+		Namespace: aws.String(m.namespace),
+		MetricData: []types.MetricDatum{
+			{
+				MetricName: aws.String("ProxyLatency"),
+				Value:      aws.Float64(latencyMs),
+				Unit:       types.StandardUnitMilliseconds,
+				Timestamp:  aws.Time(time.Now()),
+				Dimensions: []types.Dimension{
+					{
+						Name:  aws.String("Upstream"),
+						Value: aws.String(upstream),
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		slog.Error("Failed to stream metric point to AWS CloudWatch API", "error", err)
+	}
+}
+
+
+================================================
+FILE: ./internal/proxy/ratelimiter.go
+================================================
+package proxy
+
+import (
+	"net"
+	"net/http"
+	"sync"
+
+	"golang.org/x/time/rate"
+)
+
+type RateLimiter struct {
+	limiters map[string]*rate.Limiter
+	mu       sync.Mutex
+	rate     rate.Limit
+	burst    int
+}
+
+func NewRateLimiter(r rate.Limit, burst int) *RateLimiter {
+	return &RateLimiter{
+		limiters: make(map[string]*rate.Limiter),
+		rate:     r,
+		burst:    burst,
+	}
+}
+
+func (rl *RateLimiter) getLimiter(ip string) *rate.Limiter {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	limiter, exists := rl.limiters[ip]
+	if !exists {
+		limiter = rate.NewLimiter(rl.rate, rl.burst)
+		rl.limiters[ip] = limiter
+	}
+
+	return limiter
+}
+
+func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "Internal rate limiting extraction error", http.StatusInternalServerError)
+			return
+		}
+
+		if !rl.getLimiter(ip).Allow() {
+			http.Error(w, "Rate limit exceeded. Too many requests.", http.StatusTooManyRequests)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+
+================================================
+FILE: ./internal/config/config.go
+================================================
+package config
+
+import (
+	"os"
+
+	"gopkg.in/yaml.v3"
+)
+
+type ServerConfig struct {
+	ListenAddress string `yaml:"listen_address"`
+}
+
+type RouteConfig struct {
+	Upstreams []string `yaml:"upstreams"`
+}
+
+type Config struct {
+	Server ServerConfig           `yaml:"server"`
+	Routes map[string]RouteConfig `yaml:"routes"`
+}
+
+func LoadConfig(path string) (*Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+
+	}
+
+	defer file.Close()
+
+	var cfg Config
+
+	decoder := yaml.NewDecoder(file)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+
+================================================
+FILE: ./internal/logger/logger.go
+================================================
+package logger
+
+import (
+	"log/slog"
+	"os"
+)
+
+// InitLogger initializes a standardized global JSON slog configuration
+func InitLogger() {
+	// Create a new structured JSON handler writing output to standard out (stdout)
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo, // Only print Info level logs and higher (Warn, Error)
+	})
+
+	// Set this handler as the default logging engine for the entire application execution life
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+}
+
+
+================================================
+FILE: ./config.yaml
+================================================
+server:
+  listen_address: ":8080"
+
+routes:
+  api.proxy:
+    upstreams:
+      - "http://127.0.0.1:8001"
+      - "http://127.0.0.1:8002"
+      - "http://httpbin.org"
+
+================================================
+FILE: ./infra/main.tf
+================================================
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "ap-south-1"
+}
+
+#
+
+
+# IAM role so EC2 can write to CloudWatch without hardcoded credentials
+resource "aws_iam_role" "proxy" {
+  name = "go-proxy-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+resource "aws_vpc" "proxy_vpc" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  tags = { Name = "Proxy-VPC" }
+}
+
+resource "aws_subnet" "proxy_public" {
+  vpc_id                  = aws_vpc.proxy_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "ap-south-1a"
+  map_public_ip_on_launch = true
+  tags = { Name = "Proxy-Public-Subnet" }
+}
+
+resource "aws_internet_gateway" "proxy_igw" {
+  vpc_id = aws_vpc.proxy_vpc.id
+  tags = { Name = "Proxy-IGW" }
+}
+
+resource "aws_route_table" "proxy_public" {
+  vpc_id = aws_vpc.proxy_vpc.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.proxy_igw.id
+  }
+  tags = { Name = "Proxy-Public-RT" }
+}
+
+resource "aws_route_table_association" "proxy_public" {
+  subnet_id      = aws_subnet.proxy_public.id
+  route_table_id = aws_route_table.proxy_public.id
+}
+
+resource "aws_iam_role_policy_attachment" "cloudwatch" {
+  role       = aws_iam_role.proxy.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+resource "aws_iam_instance_profile" "proxy" {
+  name = "go-proxy-profile"
+  role = aws_iam_role.proxy.name
+}
+
+# Security group for the proxy instance
+resource "aws_security_group" "proxy" {
+  name        = "proxy-sg"
+  description = "Go reverse proxy security group"
+  vpc_id      = aws_vpc.proxy_vpc.id
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "proxy-sg" }
+}
+
+# EC2 instance
+resource "aws_instance" "proxy" {
+  ami                         = "ami-0f5ee92e2d63afc18"
+  instance_type               = "t2.micro"
+  subnet_id                   = aws_subnet.proxy_public.id
+  vpc_security_group_ids      = [aws_security_group.proxy.id]
+  key_name                    = "demo"
+  iam_instance_profile        = aws_iam_instance_profile.proxy.name
+  associate_public_ip_address = true
+
+  user_data = <<-EOF
+    #!/bin/bash
+    apt update -y
+    apt install -y curl
+
+    # Create directory for proxy
+    mkdir -p /opt/proxy
+
+    # Create systemd service
+    cat > /etc/systemd/system/go-proxy.service <<SERVICE
+    [Unit]
+    Description=Go Reverse Proxy
+    After=network.target
+
+    [Service]
+    Type=simple
+    User=ubuntu
+    WorkingDirectory=/opt/proxy
+    ExecStart=/opt/proxy/proxy
+    Restart=always
+    RestartSec=5
+
+    [Install]
+    WantedBy=multi-user.target
+    SERVICE
+
+    systemctl daemon-reload
+    systemctl enable go-proxy
+  EOF
+
+  tags = { Name = "Go-Proxy-Server" }
+}
+
+output "proxy_public_ip" {
+  value       = aws_instance.proxy.public_ip
+  description = "Public IP of proxy EC2 instance"
+}
+
+output "proxy_instance_id" {
+  value = aws_instance.proxy.id
+}

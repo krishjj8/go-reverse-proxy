@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxy-config
+  namespace: default
+data:
+  config.yaml: |
+    server:
+      listen_address: ":8080"
+    routes:
+      api.proxy:
+        upstreams:
+          - "http://127.0.0.1:8001"
+          - "http://127.0.0.1:8002"

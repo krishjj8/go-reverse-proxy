@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-reverse-proxy
+  namespace: default
+  labels:
+    app: go-reverse-proxy
+spec:
+  replicas: 2 
+  selector:
+    matchLabels:
+      app: go-reverse-proxy
+  template:
+    metadata:
+      labels:
+        app: go-reverse-proxy
+    spec:
+      containers:
+      - name: proxy-gateway
+        image: go-reverse-proxy:latest
+        imagePullPolicy: Never 
+        ports:
+        - containerPort: 8080
+          name: public-traffic
+        - containerPort: 9090
+          name: admin-control
+        
+        
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        
+        
+        resources:
+          limits:
+            cpu: "200m"      
+            memory: "128Mi"  
+          requests:
+            cpu: "50m"       
+            memory: "32Mi"   
+
+        
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config.yaml
+          subPath: config.yaml 
+      
+      
+      volumes:
+      - name: config-volume
+        configMap:
+          name: proxy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-reverse-proxy-service
+  namespace: default
+spec:
+  type: ClusterIP 
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: web-ingress
+    - port: 9090
+      targetPort: 9090
+      protocol: TCP
+      name: metrics-scrape
+  selector:
+    app: go-reverse-proxy

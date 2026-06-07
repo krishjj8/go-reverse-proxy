@@ -11,10 +11,10 @@ provider "aws" {
   region = "ap-south-1"
 }
 
-#
 
 
-# IAM role so EC2 can write to CloudWatch without hardcoded credentials
+
+
 resource "aws_iam_role" "proxy" {
   name = "go-proxy-role"
 

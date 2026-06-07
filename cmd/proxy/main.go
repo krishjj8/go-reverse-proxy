@@ -27,6 +27,9 @@ func main() {
 	engine := proxy.NewEngine(cfg)
 	limiter := proxy.NewRateLimiter(10, 20)
 
+	slog.Info("Initializing isolated admin control plane", "port", "9090")
+	proxy.StartAdminServer(":9090")
+
 	server := &http.Server{
 		Addr:         cfg.Server.ListenAddress,
 		Handler:      limiter.Middleware(engine),

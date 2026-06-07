@@ -2,8 +2,35 @@ package proxy
 
 import (
 	"log/slog"
+	"strconv"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+var (
+	RequestsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "proxy_requests_total",
+			Help: "Cumulative count of all inbound HTTP requests processed by the gateway edge",
+		},
+		[]string{"upstream", "status_code"},
+	)
+
+	LatencyHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "proxy_request_duration_ms",
+			Help:    "End-to-end request latency profile tracking in milliseconds",
+			Buckets: []float64{5, 10, 25, 50, 100, 250, 500, 1000},
+		},
+		[]string{"upstream"},
+	)
+)
+
+func init() {
+
+	prometheus.MustRegister(RequestsTotal, LatencyHistogram)
+}
 
 type LogEntry struct {
 	Timestamp  time.Time `json:"timestamp"`
@@ -40,7 +67,12 @@ func (te *TelemetryEngine) startLogConsumer() {
 			"latency_ms", entry.LatencyMs,
 		)
 
-		// Stream the structural data to AWS CloudWatch asynchronously out of the hot path
 		te.metrics.RecordLatency(entry.TargetHost, float64(entry.LatencyMs))
+
+		statusCodeStr := strconv.Itoa(entry.StatusCode)
+
+		RequestsTotal.WithLabelValues(entry.TargetHost, statusCodeStr).Inc()
+
+		LatencyHistogram.WithLabelValues(entry.TargetHost).Observe(float64(entry.LatencyMs))
 	}
 }
