@@ -14,10 +14,11 @@ jobs:
     - name: Checkout Source Code
       uses: actions/checkout@v4
 
+    # WEEK 5 UPGRADE: Bump version from 1.24 to 1.26 to match module requirements
     - name: Initialize Go Toolchain
       uses: actions/setup-go@v5
       with:
-        go-version: '1.24'
+        go-version: '1.26'
         cache: true
 
     - name: Verify Dependencies
@@ -44,7 +45,7 @@ jobs:
   deploy:
     needs: validate-and-build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: false
 
     steps:
     - name: Checkout Source Code
