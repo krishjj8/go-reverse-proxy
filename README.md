@@ -5,56 +5,48 @@
 ![Platform](https://img.shields.io/badge/platform-Minikube%20%7C%20AWS-orange?style=flat&logo=amazon-aws)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat)
 
-A production-grade, highly optimized Layer-7 Reverse Proxy and API Gateway written in pure Go. Routes traffic across multiple upstreams with automatic failure handling, token-bucket rate limiting, multi-stage container isolation, and a real-time asynchronous dual-telemetry engine (Prometheus Pull + AWS CloudWatch Push).
+A Layer-7 reverse proxy and API gateway written in Go. It routes traffic across multiple upstreams with round-robin load balancing, active health checks, a per-upstream circuit breaker, per-IP rate limiting, and asynchronous metrics (Prometheus pull + AWS CloudWatch push). It ships as a multi-stage distroless container with Kubernetes manifests and a Terraform-provisioned AWS deployment.
 
 ---
 
-## Quick Start
+## Quick start
 
-### 1. Local Bare-Metal Testing (The Inner Loop)
+### Local (no container)
+
 ```bash
-# Clone and build
-git clone [https://github.com/krishjj8/go-reverse-proxy](https://github.com/krishjj8/go-reverse-proxy)
+git clone https://github.com/krishjj8/go-reverse-proxy
 cd go-reverse-proxy
 go build -o proxy ./cmd/proxy/...
 
-# Start two dummy upstreams (in separate terminals)
+# Start two test upstreams in separate terminals
 python3 -m http.server 8001
 python3 -m http.server 8002
 
-# Run the proxy locally
+# Run the proxy
 ./proxy --config config.yaml
 
-# Test routing
+# Send a request
 curl -H "Host: api.proxy" http://localhost:8080/
-
 ```
 
-### 2. Local Kubernetes Orchestration (Minikube Verification)
+### Local Kubernetes (Minikube)
 
 ```bash
-# Build the highly optimized multi-stage image
 docker build -t go-reverse-proxy:latest .
-
-# Boot the local cluster and load the host container cache
 minikube start --driver=docker
 minikube image load go-reverse-proxy:latest
 
-# Deploy the decoupled cluster resources
 kubectl apply -f k8s/configmap.yaml
 kubectl apply -f k8s/deployment.yaml
-
-# Establish the local-to-cluster secure network tunnel
 kubectl port-forward svc/go-reverse-proxy-service 8080:8080 9090:9090
 
-# Test the administrative control plane health probe
+# Health check (admin port)
 curl -i http://localhost:9090/healthz
 
-# Test the data plane rate limiter burst boundaries (watch for 429s)
+# Exercise the rate limiter — expect some 429s
 for i in {1..30}; do
   curl -s -o /dev/null -w "%{http_code}\n" -H "Host: api.proxy" http://localhost:8080/
 done
-
 ```
 
 ---
@@ -62,167 +54,117 @@ done
 ## Architecture
 
 ```
-                       Client Inbound Request
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │    DATA PLANE (Port 8080) │
-                    └─────────────┬─────────────┘
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │       Rate Limiter        │
-                    │   (Token Bucket per IP)   │
-                    └─────────────┬─────────────┘
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │      Circuit Breaker      │
-                    │   Closed ⇆ Open ⇆ Half    │
-                    └─────────────┬─────────────┘
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │ Round-Robin Load Balancer │
-                    │ [target-1] [target-2] ... │
-                    └─────────────┬─────────────┘
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │ Tuned HTTP Transport Pool │
-                    │   HTTP Keep-Alive Reuse   │
-                    └─────────────┬─────────────┘
-                                  │
-             ┌────────────────────┴────────────────────┐
-             ▼                                         ▼
-   Upstream Target A                         Upstream Target B
-             │                                         │
-             └────────────────────┬────────────────────┘
-                                  │ (Async Channel Enqueue)
-                                  ▼
-                    ┌───────────────────────────┐
-                    │  Async Telemetry Engine   │
-                    └─────────────┬─────────────┘
-                                  │
-             ┌────────────────────┴────────────────────┐
-             ▼                                         ▼
- CONTROL PLANE (Port 9090)               OUTER LOOP (Cloud)
- ├── /healthz (Orchestration Probe)       └── AWS CloudWatch Pipeline
- └── /metrics (Prometheus RAM Vectors)           (Active SDK Push)
-
+                    Client request
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │   Data plane  (:8080) │
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │  Rate limiter         │
+              │  (token bucket / IP)  │
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │  Circuit breaker      │
+              │  closed ⇆ open ⇆ half │
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │  Round-robin balancer │
+              │  [target-1][target-2] │
+              └───────────┬───────────┘
+                          ▼
+              ┌───────────────────────┐
+              │  HTTP transport pool  │
+              │  (keep-alive reuse)   │
+              └───────────┬───────────┘
+                ┌─────────┴─────────┐
+                ▼                   ▼
+            Upstream A          Upstream B
+                └─────────┬─────────┘
+                          │  enqueue (buffered channel)
+                          ▼
+              ┌───────────────────────┐
+              │  Telemetry worker     │
+              └───────────┬───────────┘
+                ┌─────────┴─────────┐
+                ▼                   ▼
+   Control plane (:9090)      AWS CloudWatch (push)
+   ├── /healthz
+   └── /metrics (Prometheus)
 ```
 
 ---
 
 ## Features
 
-### Round-Robin Load Balancing
+### Round-robin load balancing
 
-Distributes requests across multiple upstream servers using a thread-safe upstream pool protected by `sync.RWMutex`. The design allows many concurrent readers while cluster health checks or backend status modifications safely run in the background.
+Requests are distributed across upstreams from a pool guarded by `sync.RWMutex`, so many requests can read the upstream list concurrently while the background health check updates it.
 
-### Circuit Breaker Protection
+### Circuit breaker
 
-Implements a three-state finite state machine to prevent cascading application crashes:
+A three-state breaker per upstream:
 
-* **Closed** — Normal operation, all incoming traffic forwarded cleanly.
-* **Open** — Upstream marked unhealthy after 3 consecutive failures; traffic path is immediately short-circuited at the perimeter to protect system memory resources.
-* **Half-Open** — After a 10-second cooldown window, a single canary request is let through to determine whether the target backend has fully recovered.
+- **Closed** — normal; requests are forwarded.
+- **Open** — after 3 consecutive failures, requests to that upstream are short-circuited.
+- **Half-open** — after a 10s cooldown, one request is allowed through to test recovery. Success closes the breaker; failure reopens it.
 
-### Per-IP Rate Limiting
+### Per-IP rate limiting
 
-Uses an in-memory, thread-safe token-bucket implementation powered by `golang.org/x/time/rate`.
+In-memory token bucket via `golang.org/x/time/rate`. Defaults: 10 req/s refill, burst 20. Over the limit returns `429 Too Many Requests`. (Currently hardcoded — see Known limitations.)
 
-| Parameter | Value |
-| --- | --- |
-| Refill Rate | 10 requests/second |
-| Burst Capacity | 20 requests |
+### Connection pooling
 
-Exceeding these configured thresholds drops connection paths at the perimeter middleware and returns an `HTTP 429 Too Many Requests`.
+The HTTP transport reuses keep-alive connections (`MaxIdleConnsPerHost = 100`) to avoid a TCP/TLS handshake on every request.
 
-### Connection Pool Optimization
+### Asynchronous metrics
 
-The HTTP transport layout is heavily tuned to minimize connection setup overhead under sustained traffic:
+The request path makes no metrics or logging network calls inline. Each handled request enqueues a small record on a buffered channel, and a background worker drains it and updates two sinks:
 
-```go
-MaxIdleConnsPerHost = 100
+1. **Prometheus** — in-memory counters and histograms, scraped from `/metrics`.
+2. **AWS CloudWatch** — sent via `PutMetricData`.
 
-```
-
-Reusing persistent TCP keep-alive connections cuts down handshake processing latency and improves raw system throughput.
-
-### Asynchronous Dual-Telemetry Pipeline
-
-Request handlers never block on external logging blocks or slow network API calls. Transaction data is dropped into an internal buffered channel in nanoseconds. A dedicated background consumer worker drains the queue and handles two streams:
-
-1. **Prometheus Vectors:** Updates thread-safe counters and histogram metrics resident in local RAM.
-2. **AWS CloudWatch:** Dispatches structured JSON objects and metrics updates to the AWS SDK client.
+This keeps the request path off slow external calls. (See Known limitations for the backpressure case this design doesn't yet handle.)
 
 ---
 
-## What I Learned
+## What I learned
 
-Building this reverse proxy significantly deepened my understanding of backend systems, concurrency, networking, and cloud-native architecture.
-
-**Synchronization primitives and scalability** — A standard `sync.Mutex` serializes all access and quickly becomes a bottleneck at scale. Migrating the upstream pool to `sync.RWMutex` allows thousands of concurrent reads while still protecting writes from the health-check goroutine. This tradeoff only becomes visible under load, which reinforced the value of thinking about access patterns before reaching for the simplest lock.
-
-**Circuit breaker resilience** — The Half-Open state is easy to skip in a naive implementation, but it's the most important part. Without it, a recovered backend either never gets traffic back (stuck Open) or gets slammed immediately (no protection). Implementing the canary request pattern made the failure modes concrete and testable.
-
-**Git internals in production** — Accidentally committing Terraform provider binaries that exceeded GitHub's file size limits forced me to rewrite the repository history with `git filter-branch`. That experience built intuition for how Git's object model actually works — commits, trees, and blobs — rather than just the surface-level commands.
-
-**CI/CD on real infrastructure** — Debugging SCP permission failures in GitHub Actions taught me that non-root users, sudo boundaries, and file system ownership interact in subtle ways that local testing never surfaces. The fix was simple once understood; getting there required reading systemd logs, not just the Actions output.
-
-**Async observability as a design constraint** — Seeing metrics arrive in CloudWatch while the proxy stayed responsive under load made the producer-consumer pattern click. Decoupling observation from execution isn't just a performance optimization — it's a correctness guarantee that the hot path stays predictable.
-
-**Week 5 Isolation Mechanics** — Adding Prometheus metric vectors made me realize that vector coordinates do not explicitly initialize in the scraped text map layout on boot. They only materialize in memory once the first packet triggers the channel consumer loop and calls `.WithLabelValues()`. This optimizes RAM allocation within the cluster framework.
+- **`RWMutex` vs `Mutex`** — the upstream list is read on every request and written only by the health check. A plain `Mutex` serializes everything; `RWMutex` lets reads run concurrently and only blocks during the infrequent write. The difference only shows up under load.
+- **The half-open state matters** — it's easy to skip, but without it a recovered backend either never gets traffic back (stuck open) or gets flooded immediately (no protection). The single canary request is what makes recovery safe.
+- **Git's object model** — I committed Terraform provider binaries that exceeded GitHub's 100MB limit, and they stayed in history even after I updated `.gitignore`. Fixing it with `git filter-branch` forced me to actually understand commits, trees, and blobs instead of just the surface commands.
+- **CI on real infrastructure** — debugging SCP permission failures in GitHub Actions came down to how non-root users, sudo, and file ownership interact — things local testing never surfaced. The answer was in the systemd logs, not the Actions output.
+- **Async observability as a design choice** — decoupling metrics from the request path with a producer/consumer queue keeps the hot path predictable even when CloudWatch is slow. (The remaining edge case is in Known limitations.)
+- **Prometheus label series are lazy** — a metric with labels doesn't appear in `/metrics` until the first time that label combination is recorded with `WithLabelValues(...)`. So immediately after startup, before any traffic, the per-upstream series simply don't exist yet.
 
 ---
 
-## Architectural Decisions
+## Design decisions
 
-### Why Token Bucket Instead of Fixed Window Rate Limiting?
+### Token bucket over fixed window
 
-Fixed-window limiters can accidentally allow large traffic spikes at window boundaries (the "thundering herd at reset" problem). Token bucket algorithms smooth traffic naturally while still permitting controlled bursts, making them a better fit for production APIs where fairness matters more than simplicity.
+Fixed-window limiters can let a burst through at a window boundary (effectively two windows' worth back to back). A token bucket smooths traffic while still allowing a controlled burst.
 
-### Why Use Buffered Channels for Telemetry?
+### Buffered channel for telemetry
 
-Writing logs or publishing metrics directly inside the request path increases tail latency and creates tight coupling between the proxy's hot path and the availability of CloudWatch. The producer-consumer pattern separates concerns: the request handler stays lean, and the telemetry worker can retry, batch, or drop metrics independently.
+Publishing metrics inline would tie request latency to CloudWatch's availability. A producer/consumer split keeps the handler lean and lets the worker handle — or drop — telemetry independently of the request path.
 
-### Why Use RWMutex Instead of Mutex?
+### Removing hop-by-hop headers
 
-The upstream list is read on every request and modified only during health checks. A standard mutex would serialize all access even when no write is occurring. `sync.RWMutex` allows arbitrarily many concurrent readers with no contention, while still guaranteeing exclusive access during the infrequent writes from the health-check goroutine.
+`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, and similar headers are connection-specific per RFC 7230 and must not be forwarded by an intermediary. Forwarding them causes mismanaged keep-alive state and hard-to-debug errors at the upstream.
 
-### Why Remove Hop-by-Hop Headers?
+### Distroless runtime
 
-Headers such as `Connection`, `Keep-Alive`, `Transfer-Encoding`, and `Upgrade` are defined as connection-specific by the HTTP/1.1 specification (RFC 7230) and must not be forwarded by intermediaries. Forwarding them causes protocol violations, mismanaged keep-alive state, and hard-to-debug connection errors at the upstream.
-
-### Why Use Google Distroless Runtimes?
-
-By swapping out heavy standard images for a minimal `gcr.io/distroless/static` baseline, the production footprint drops to just ~25MB. More importantly, it strips away full system shells (`/bin/sh`, `/bin/bash`) and package managers (`apk`, `apt`), meaning an attacker cannot execute local system commands or pull down external shell scripts even if a code exploit occurs.
-
----
-
-## Installation
-
-```bash
-# Clone
-git clone [https://github.com/krishjj8/go-reverse-proxy](https://github.com/krishjj8/go-reverse-proxy)
-cd go-reverse-proxy
-
-# Install and synchronize dependencies
-go get [github.com/prometheus/client_golang/prometheus](https://github.com/prometheus/client_golang/prometheus)
-go mod download
-go mod verify
-
-# Compile native binary via Docker multi-stage environment
-docker build -t go-reverse-proxy:latest .
-
-```
+`gcr.io/distroless/static` keeps the image around ~25MB and removes the shell and package manager, so there's no `/bin/sh`, `apt`, or `apk` available to an attacker if the process is ever compromised.
 
 ---
 
 ## Configuration
 
-Edit `config.yaml` to define your listen address and upstream targets:
+Edit `config.yaml` to set the listen address and upstream targets:
 
 ```yaml
 server:
@@ -233,82 +175,96 @@ routes:
     upstreams:
       - "http://payment-svc:8001"
       - "http://inventory-svc:8002"
-
 ```
 
-Route matching is done via the incoming `Host` header. Under Kubernetes orchestration, these addresses target the stable internal cluster CoreDNS virtual endpoints.
+Routing is matched on the incoming `Host` header. Under Kubernetes, these addresses resolve to internal Service DNS names.
 
 ---
 
-## Infrastructure & Environment
+## Installation
 
-### Kubernetes Environment (Local Developer Inner Loop)
+```bash
+git clone https://github.com/krishjj8/go-reverse-proxy
+cd go-reverse-proxy
+go mod download && go mod verify
+docker build -t go-reverse-proxy:latest .
+```
 
-* **Local Runner:** Minikube virtualized runtime using the host Docker engine driver.
-* **Decoupled Architecture:** Configuration states are completely abstracted away from immutable image layers. The cluster `ConfigMap` parameter rules are dynamically injected into the running pod's filesystem via storage volume definitions at boot time.
+---
 
-### Cloud Platform (Production Outer Loop)
+## Deployment
 
-* AWS EC2 (t2.micro)
-* Ubuntu 24.04 LTS
-* Deployed behind a systemd service (`go-proxy.service`)
-* Custom VPC with public subnets, Internet Gateways, and security group rule allocations clamping incoming ingress strictly to port `8080`.
+### Kubernetes (local, Minikube)
 
-### Cloud Security
+- Minikube using the Docker driver.
+- Config is kept out of the image: the `ConfigMap` is mounted into the pod as a volume at startup, so config changes don't require a rebuild.
 
-No hardcoded AWS access keys or secret blocks exist in the source or configuration code. CloudWatch `PutMetricData` actions are handled via temporary tokens provisioned through an IAM Instance Profile attached directly to the hosting instance compute layer (IMDSv2 standard).
+### AWS (single EC2)
+
+- EC2 `t2.micro`, Ubuntu 24.04, run as a `systemd` service (`go-proxy.service`).
+- Custom VPC, public subnet, internet gateway, and a security group that allows ingress on port `8080` only.
+- No AWS keys in the source. CloudWatch `PutMetricData` uses temporary credentials from an IAM instance profile (IMDSv2).
 
 ---
 
 ## Observability
 
-The proxy splits its monitoring profile across a public Data Plane and a private Control Plane to isolate resource contention.
+The proxy uses two ports: the data plane (`8080`) serves traffic; the admin plane (`9090`) serves health and metrics.
 
-Custom metrics tracked and exposed via port `9090/metrics`:
+Metrics on `:9090/metrics`:
 
-| Metric Name | Type | Label Dimensions | Purpose |
+| Metric | Type | Labels | Purpose |
 | --- | --- | --- | --- |
-| `proxy_requests_total` | Counter | `upstream`, `status_code` | Monitors real-time transaction volume and system error budgets. |
-| `proxy_request_duration_ms` | Histogram | `upstream` | Profiles latency bucket distributions to map p99 performance curves. |
+| `proxy_requests_total` | Counter | `upstream`, `status_code` | Request volume and error rates |
+| `proxy_request_duration_ms` | Histogram | `upstream` | Latency distribution (p50/p90/p99) |
 
-Because all monitoring data is processed asynchronously via memory-resident loops, metric collection adds near-zero overhead to hot request paths.
+Metrics are updated by the background worker, so collection adds little overhead to the request path.
 
 ---
 
-## CI/CD Pipeline
+## CI
 
-Every code update pushed to the `main` branch fires an automated GitHub Actions testing and compilation verification matrix:
+GitHub Actions runs on every push to `main`:
 
-| Stage | Command / Job | Purpose |
+| Stage | Command | Purpose |
 | --- | --- | --- |
-| Toolchain Init | `actions/setup-go@v5` | Boots an isolated runner using **Go 1.26** to match modules requirements. |
-| Dependency Verify | `go mod verify` | Validates cryptographic checksum footprints of external modules. |
-| Format Check | `gofmt -l .` | Rejects the workflow run if code changes violate Go syntax patterns. |
-| Cross-Compile | `go build ./cmd/proxy/...` | Verifies full compiler approval by producing a static Linux binary. |
-| Cloud Deploy | `if: false` (Paused) | Skipped during local Minikube testing intervals to safely prevent AWS billing accumulators. |
+| Go toolchain | `actions/setup-go@v5` (Go 1.26) | Pin the build version |
+| Dependencies | `go mod verify` | Check module checksums |
+| Format | `gofmt -l .` | Fail the run on unformatted code |
+| Build | `go build ./cmd/proxy/...` | Compile a static Linux binary |
+| Deploy | disabled (`if: false`) | SSH-to-EC2 deploy, off by default |
 
 ---
 
-## Deployment Debugging Log
+## Known limitations / next steps
 
-Real issues hit during development, documented for reference.
+- **Telemetry enqueue can block under backpressure.** The worker is a single consumer that calls CloudWatch synchronously; if CloudWatch is slow or throttles, the buffered channel fills and the enqueue on the request path blocks. Planned fix: a non-blocking send that drops (and counts) records when the buffer is full, plus a timeout on the CloudWatch call.
+- **The rate-limiter map grows unbounded.** One `rate.Limiter` is kept per client IP and never evicted. Planned fix: evict idle entries (last-seen timestamp + periodic sweep, or an LRU).
+- **Client IP comes from `RemoteAddr`.** Behind an ingress or load balancer, that's the proxy's address rather than the real client, so rate limiting groups everyone behind the LB. Planned fix: read `X-Forwarded-For` / `X-Real-Ip`, trusting it only from known proxies.
+- **Per-request CloudWatch `PutMetricData`.** One API call per request is costly and rate-limited at volume; Prometheus is the primary metrics path. Planned: batch the calls or make CloudWatch optional.
+- **Health check is a root `GET`.** It treats any non-200 as unhealthy, doesn't use a dedicated health endpoint, and doesn't close the response body on the non-200 path. Planned: a configurable health path and always closing the body.
+- **Rate-limit and breaker thresholds are hardcoded.** They should move into `config.yaml`.
+- **No tests yet.** The circuit breaker and rate limiter are pure logic and are the first things to unit-test, alongside adding `go vet` and `go test ./...` to CI.
 
-### SSH Key Permission Fix
+---
 
-Linux refuses SSH keys with world-readable permissions:
+## Debugging log
+
+Real issues hit during development, kept for reference.
+
+### SSH key permissions
+
+SSH rejects keys with world-readable permissions:
 
 ```bash
 mv ~/Downloads/demo.pem ~/.ssh/demo.pem
 chmod 400 ~/.ssh/demo.pem
-ssh -i ~/.ssh/demo.pem ubuntu@<your-ec2-public-ip>
-
+ssh -i ~/.ssh/demo.pem ubuntu@<ec2-public-ip>
 ```
 
-### Removing Terraform Provider Binaries from Git History
+### Removing Terraform binaries from Git history
 
-Large Terraform provider files exceeded GitHub's 100MB file size limit and persisted in commit history even after `.gitignore` was updated.
-
-First, extend `.gitignore`:
+Provider files over GitHub's 100MB limit persisted in history even after `.gitignore` was updated.
 
 ```bash
 cat >> .gitignore << 'EOF'
@@ -319,72 +275,61 @@ cat >> .gitignore << 'EOF'
 .terraform.lock.hcl
 EOF
 
-```
-
-Then rewrite history to remove the files:
-
-```bash
 git filter-branch --force --index-filter \
   "git rm -rf --cached --ignore-unmatch infra/.terraform/" \
   --prune-empty --tag-name-filter cat -- --all
 
 git push origin main --force
-
 ```
 
-### Fixing SCP Deployment Permissions
+### SCP deploy permissions
 
-Direct uploads to `/opt` failed because GitHub Actions connects as the non-root `ubuntu` user:
+GitHub Actions connects as the non-root `ubuntu` user, so direct writes to `/opt` failed:
 
 ```bash
-# Upload to home directory first
+# Upload to the home directory first
 scp -i key proxy-binary ubuntu@<host>:~/proxy-binary
 
-# Then move with sudo on the instance
+# Then move it with sudo on the instance
 sudo mkdir -p /opt/proxy
 sudo mv ~/proxy-binary /opt/proxy/proxy
 sudo chmod +x /opt/proxy/proxy
-
 ```
 
-### Toolchain Version Mismatches
+### Go version mismatch
 
-When updating dependencies for Prometheus integration, local module setups required Go 1.26 features while Docker base image environments targeted a Go 1.24 container runner. This triggered compiler safety terminations during the `go mod download` lifecycle. The mismatch was resolved by upgrading the `Dockerfile` builder stage target reference directly to `golang:1.26-alpine`.
+Local builds used Go 1.26 while the Docker builder image was on 1.24, which broke `go mod download`. Fixed by pinning the builder stage to `golang:1.26-alpine`.
 
 ---
 
-## Validation Commands
+## Validation
 
 ```bash
-# Verify the Administrative Control Plane Health Loop
+# Admin health
 curl -i http://localhost:9090/healthz
 
-# Extract real-time memory-resident metrics allocations
+# Current metrics
 curl http://localhost:9090/metrics
 
-# Basic routing validation test via the local host tunnel
+# Routing
 curl -H "Host: api.proxy" http://localhost:8080/
 
-# Rate limiter load generation test — expect 20 successful responses followed by 429 drops
+# Rate limiter — expect ~20 OK responses, then 429s
 hey -n 50 -c 5 -H "Host: api.proxy" http://localhost:8080/
-
 ```
 
 ---
 
-## Project Structure
+## Project layout
 
 ```
 go-reverse-proxy/
-├── cmd/proxy/          # Entrypoint (Main loop initialization)
-├── internal/proxy/     # Core engine logic (rate limiter, circuit breaker, admin control plane, telemetry)
-├── internal/config/    # YAML configuration subsystem decoder logic
-├── internal/logger/    # Structured machine-readable JSON logging config
-├── k8s/                # Kubernetes Orchestration (ConfigMaps, HA Deployments, LoadBalancer Services)
-├── Dockerfile          # Secure, multi-stage optimized Distroless compilation script
-├── config.yaml         # Local bare-metal routing rules matrix parameter file
-└── go.mod              # Module dependencies and toolchain safety maps
-
-```
-
+├── cmd/proxy/        # main: startup, signal handling, graceful shutdown
+├── internal/proxy/   # engine: balancer, circuit breaker, rate limiter, admin server, telemetry
+├── internal/config/  # YAML config loader
+├── internal/logger/  # structured JSON logging (slog)
+├── k8s/              # ConfigMap, Deployment, Service
+├── Dockerfile        # multi-stage distroless build
+├── config.yaml       # routing config
+└── go.mod
 ```
