@@ -14,16 +14,14 @@ import (
 	"github.com/krishjj8/go-reverse-proxy/internal/config"
 )
 
-// CircuitState represents our State Machine boundaries
 type CircuitState int
 
 const (
-	StateClosed   CircuitState = iota // 0: Healthy operations
-	StateOpen                         // 1: Tripped open; block traffic
-	StateHalfOpen                     // 2: Canary trial mode
+	StateClosed CircuitState = iota
+	StateOpen
+	StateHalfOpen
 )
 
-// CircuitBreaker manages dynamic failure tracking metrics for an upstream host
 type CircuitBreaker struct {
 	state           CircuitState
 	failureCount    int
@@ -89,11 +87,10 @@ func (cb *CircuitBreaker) RecordFailure() {
 	}
 }
 
-// RetryTransport handles custom transport interceptor logic with async telemetry
 type RetryTransport struct {
 	underlying http.RoundTripper
 	pool       *UpstreamPool
-	telemetry  *TelemetryEngine // Injected async logging pipeline access
+	telemetry  *TelemetryEngine
 }
 
 func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -107,7 +104,6 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 
-	// Start the clock baseline immediately to calculate total routing latency
 	startTime := time.Now()
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -136,13 +132,11 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp, err = t.underlying.RoundTrip(req)
 		currentUpstream := req.URL.Scheme + "://" + req.URL.Host
 
-		// Success condition execution pathway
 		if err == nil && resp.StatusCode < 500 {
 			if breaker, exists := t.pool.breakers[currentUpstream]; exists {
 				breaker.RecordSuccess()
 			}
 
-			// Drop log entry into the buffered queue asynchronously and return instantly
 			t.telemetry.LogQueue <- LogEntry{
 				Timestamp:  time.Now(),
 				Path:       req.URL.Path,
@@ -162,7 +156,6 @@ func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
-	// Final disaster fallback metric tracker if all retries collapse completely
 	finalStatus := 502
 	if resp != nil {
 		finalStatus = resp.StatusCode
@@ -216,7 +209,7 @@ func (p *UpstreamPool) Next() string {
 type Engine struct {
 	routingTable map[string]*UpstreamPool
 	transport    http.RoundTripper
-	telemetry    *TelemetryEngine // Cached global reference for async telemetry drops
+	telemetry    *TelemetryEngine
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -233,7 +226,6 @@ func NewEngine(cfg *config.Config) *Engine {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	// Start up our thread-safe asynchronous logging worker with a 10,000 log slot memory queue capacity
 	telemetryEngine := NewTelemetryEngine(10000)
 
 	table := make(map[string]*UpstreamPool)
@@ -255,7 +247,7 @@ func NewEngine(cfg *config.Config) *Engine {
 	return &Engine{
 		routingTable: table,
 		transport:    customTransport,
-		telemetry:    telemetryEngine, // Save reference in the instantiated proxy structural context
+		telemetry:    telemetryEngine,
 	}
 }
 
@@ -322,7 +314,7 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport: &RetryTransport{
 			underlying: e.transport,
 			pool:       pool,
-			telemetry:  e.telemetry, // Map the telemetry pipeline right to our transport line worker
+			telemetry:  e.telemetry,
 		},
 	}
 
