@@ -26,14 +26,6 @@ spec:
           name: admin-control
         
         
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 9090
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        
-        
         resources:
           limits:
             cpu: "200m"      
@@ -43,11 +35,36 @@ spec:
             memory: "32Mi"   
 
         
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          periodSeconds: 10
+          timeoutSeconds: 2
+          successThreshold: 1
+          failureThreshold: 3
+        
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+        
         volumeMounts:
         - name: config-volume
           mountPath: /config.yaml
           subPath: config.yaml 
-      
       
       volumes:
       - name: config-volume
@@ -72,3 +89,23 @@ spec:
       name: metrics-scrape
   selector:
     app: go-reverse-proxy
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: go-reverse-proxy-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: api.proxy
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: go-reverse-proxy-service
+            port:
+              number: 8080
