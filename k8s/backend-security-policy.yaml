@@ -1,0 +1,18 @@
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: isolate-payments-backend
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app: target-payment
+  ingress:
+  - fromEndpoints:
+    - matchLabels:
+        app: go-reverse-proxy
+    toPorts:
+    - ports:
+      - port: "8001"
+        protocol: TCP
+      
