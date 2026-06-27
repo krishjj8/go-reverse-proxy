@@ -4,6 +4,5 @@ server:
 routes:
   api.proxy:
     upstreams:
-      - "http://127.0.0.1:8001"
-      - "http://127.0.0.1:8002"
-      
+      - "http://payment-svc-stable:8001" 
+      - "http://payment-svc-canary:8001" 
