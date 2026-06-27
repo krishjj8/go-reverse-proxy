@@ -14,10 +14,10 @@ spec:
         protocol: TCP
 
   - fromEntities:
-    - host          
+    - host         
     fromEndpoints:
     - matchLabels:
-        app: prometheus
+        app: prometheus 
     toPorts:
     - ports:
       - port: "9090"
