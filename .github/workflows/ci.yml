@@ -1,20 +1,27 @@
-name: CI/CD Pipeline
+name: CI/CD Platform Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ main ]
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/go-reverse-proxy
 
 jobs:
   validate-and-build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write  
 
     steps:
     - name: Checkout Source Code
       uses: actions/checkout@v4
 
-    # WEEK 5 UPGRADE: Bump version from 1.24 to 1.26 to match module requirements
+    
     - name: Initialize Go Toolchain
       uses: actions/setup-go@v5
       with:
@@ -24,6 +31,7 @@ jobs:
     - name: Verify Dependencies
       run: go mod download && go mod verify
 
+    
     - name: Check Formatting
       run: |
         if [ -n "$(gofmt -l .)" ]; then
@@ -32,54 +40,36 @@ jobs:
           exit 1
         fi
 
-    - name: Build Linux Binary
-      run: |
-        GOOS=linux GOARCH=amd64 go build -o proxy-binary ./cmd/proxy/...
+    - name: Execute Go Automated Test Suites
+      run: go test -v ./...
 
-    - name: Upload Binary
-      uses: actions/upload-artifact@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GitHub Container Registry (GHCR)
+      uses: docker/login-action@v3
       with:
-        name: proxy-binary
-        path: proxy-binary
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
-  deploy:
-    needs: validate-and-build
-    runs-on: ubuntu-latest
-    if: false
-
-    steps:
-    - name: Checkout Source Code
-      uses: actions/checkout@v4
-
-    - name: Download Binary
-      uses: actions/download-artifact@v4
+    - name: Extract Metadata (Tags, Labels) for Docker
+      id: meta
+      uses: docker/metadata-action@v5
       with:
-        name: proxy-binary
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=sha,format=short
+          latest
 
-    - name: Setup SSH
-      run: |
-        mkdir -p ~/.ssh
-        echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
-        chmod 600 ~/.ssh/deploy_key
-        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
-
-    - name: Copy files to EC2
-      run: |
-        chmod +x proxy-binary
-        scp -i ~/.ssh/deploy_key proxy-binary ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/proxy-binary
-        scp -i ~/.ssh/deploy_key config.yaml ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:~/config.yaml
-
-    - name: Start proxy service
-      run: |
-        ssh -i ~/.ssh/deploy_key ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} \
-          "sudo mkdir -p /opt/proxy && \
-           sudo mv ~/proxy-binary /opt/proxy/proxy && \
-           sudo mv ~/config.yaml /opt/proxy/config.yaml && \
-           sudo chmod +x /opt/proxy/proxy && \
-           sudo systemctl restart go-proxy && \
-           sudo systemctl status go-proxy"
-
-    - name: Verify proxy responding
-      run: |
-        sleep 5
-        curl -f -H "Host: api.proxy" http://${{ secrets.EC2_HOST }}:8080/
+    - name: Build and Push Proxy Container Image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max

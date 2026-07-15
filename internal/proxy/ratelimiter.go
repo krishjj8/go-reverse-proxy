@@ -45,6 +45,9 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		}
 
 		if !rl.getLimiter(ip).Allow() {
+
+			RequestsTotal.WithLabelValues("rate_limiter", "429").Inc()
+
 			http.Error(w, "Rate limit exceeded. Too many requests.", http.StatusTooManyRequests)
 			return
 		}

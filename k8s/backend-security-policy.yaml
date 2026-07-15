@@ -1,24 +1,18 @@
 apiVersion: "cilium.io/v2"
 kind: CiliumNetworkPolicy
 metadata:
-  name: secure-proxy-perimeter
+  name: isolate-payments-backend
   namespace: default
 spec:
   endpointSelector:
     matchLabels:
-      app: go-reverse-proxy
+      app: target-payment
   ingress:
-  - toPorts:
-    - ports:
-      - port: "8080"
-        protocol: TCP
-
-  - fromEntities:
-    - host          
-    fromEndpoints:
+  - fromEndpoints:
     - matchLabels:
-        app: prometheus
+        app: go-reverse-proxy
     toPorts:
     - ports:
-      - port: "9090"
+      - port: "8001"
         protocol: TCP
+      

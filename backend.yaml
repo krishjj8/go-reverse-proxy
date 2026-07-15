@@ -16,7 +16,7 @@ spec:
       containers:
       - name: http-echo
         image: hashicorp/http-echo:1.0.0
-        args: ["-text=💳 [STABLE-V1] Payment Request Processed Successfully"]
+        args: ["-text=[STABLE-V1] Payment Request Processed Successfully"]
         ports:
         - containerPort: 5678
 ---
