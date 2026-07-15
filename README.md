@@ -1,9 +1,10 @@
 # go-reverse-proxy
 
 ![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go&logoColor=white)
-![CI](https://github.com/krishjj8/go-reverse-proxy/actions/workflows/ci.yml/badge.svg)
-![Platform](https://img.shields.io/badge/platform-kind%20%7C%20AWS-326ce5?style=flat&logo=kubernetes)
-![License](https://img.shields.io/badge/license-MIT-green?style=flat)
+![CI/CD Platform Pipeline](https://github.com/krishjj8/go-reverse-proxy/actions/workflows/ci.yml/badge.svg)
+![Platform](https://img.shields.io/badge/Platform-Kind%20%7C%20Cilium%20eBPF-326ce5?style=flat&logo=kubernetes)
+![Registry](https://img.shields.io/badge/Registry-GHCR.io-orange?style=flat&logo=github)
+![License](https://img.shields.io/badge/License-MIT-green?style=flat)
 
 A Layer-7 reverse proxy and API gateway written in Go. Routes traffic across multiple upstreams with round-robin load balancing, active health checks, a per-upstream circuit breaker, per-IP token-bucket rate limiting, and asynchronous metrics (Prometheus pull + AWS CloudWatch push). Ships as a multi-stage distroless container, deployed on a **Cilium/eBPF** kind cluster (kube-proxy fully disabled) and managed by the companion [go-proxy-operator](https://github.com/krishjj8/go-proxy-operator).
 
@@ -228,19 +229,22 @@ kubectl scale deployment payment-canary-deployment --replicas=0
 
 The `startHealthCheckLoop()` goroutine polls each upstream every 5 seconds. When the canary stops responding, it is removed from the `healthy` slice. All subsequent `UpstreamPool.Next()` calls skip it — user-facing requests continue returning `200 OK` with `0 ms` added latency.
 
-**Key log line:**
-```
-level=INFO msg="Upstream detected as UNHEALTHY" upstream="http://payment-svc-canary:8001"
-```
-
-CloudWatch `PutMetricData` network timeouts appear in the background worker log — proving the telemetry goroutine blocks independently and never stalls the request path.
-
 **PromQL:** `sum(rate(proxy_requests_total[1m])) by (upstream)`
 
 The canary series drops to zero. The stable series immediately doubles to absorb the full load.
 
 ![Health failover Grafana view](images/exp4.png)
 ![Failover per-upstream detail](images/exp4-4.png)
+
+**Real-time log output during failover:**
+
+```json
+{"time":"2026-07-15T18:24:31.773Z","level":"WARN","msg":"Upstream detected as UNHEALTHY","upstream":"http://payment-svc-canary:8001","reason":"connect: no route to host"}
+{"time":"2026-07-15T18:24:31.989Z","level":"INFO","msg":"Telemetry event dispatched asynchronously","target":"http://payment-svc-stable:8001","status":200,"latency_ms":0}
+{"time":"2026-07-15T18:24:32.240Z","level":"ERROR","msg":"Failed to stream metric point to AWS CloudWatch API","error":"ec2imds: GetMetadata, request send failed, dial tcp 169.254.169.254:80: i/o timeout"}
+```
+
+The three lines together demonstrate the core async guarantee: the CloudWatch worker times out trying to reach the EC2 metadata endpoint (line 3), but that I/O block lives entirely inside the background goroutine. The user-facing request (line 2) already resolved at `0 ms` with `200 OK` — the telemetry path cannot stall the data path.
 
 ---
 
@@ -278,16 +282,80 @@ terraform init && terraform apply
 
 ---
 
-## CI
+## CI/CD
 
-GitHub Actions on every push to `main`:
+GitHub Actions on every push to `main` and every pull request. Builds a multi-stage image and pushes it to the GitHub Container Registry (`ghcr.io`):
 
-| Stage | Command |
-|---|---|
-| Dependencies | `go mod verify` |
-| Format | `gofmt -l .` |
-| Build | `go build ./cmd/proxy/...` |
-| Deploy | disabled by default (`if: false`) |
+```yaml
+name: CI/CD Platform Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/go-reverse-proxy
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+        cache: true
+
+    - name: Verify dependencies
+      run: go mod download && go mod verify
+
+    - name: Check formatting
+      run: |
+        if [ -n "$(gofmt -l .)" ]; then
+          echo "Files not formatted cleanly:"
+          gofmt -l .
+          exit 1
+        fi
+
+    - name: Run tests
+      run: go test -v ./...
+
+    - uses: docker/setup-buildx-action@v3
+
+    - uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract image metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=sha,format=short
+          latest
+
+    - name: Build and push
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+```
 
 ---
 
@@ -318,6 +386,7 @@ go-reverse-proxy/
 │   ├── configmap.yaml
 │   ├── deployment.yaml
 │   └── backend-security-policy.yaml
+├── images/             # experiment telemetry screenshots (exp2, exp3, exp4)
 ├── infra/              # Terraform: VPC, EC2, IAM, CloudWatch
 ├── Dockerfile          # multi-stage distroless build (golang:1.26-alpine → distroless/static)
 ├── kind-config.yaml    # disables default CNI and kube-proxy for Cilium
