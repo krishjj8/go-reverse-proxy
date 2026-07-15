@@ -175,6 +175,75 @@ curl -H "Host: api.proxy" http://localhost:8080/
 
 ---
 
+## Experiments
+
+### Experiment 2 — Layer 7 round-robin load balancing
+
+**What it tests:** Concurrency-safe routing distribution across the upstream pool.
+
+Dispatched 40 requests against `:8080`. The `UpstreamPool.Next()` method increments a counter under `sync.Mutex` and selects `healthy[counter % len(healthy)]`, producing exact 50/50 split across stable and canary.
+
+```bash
+for i in $(seq 1 40); do
+  curl -s -o /dev/null -H "Host: api.proxy" http://localhost:8080/
+done
+```
+
+**PromQL:** `sum(rate(proxy_requests_total[1m])) by (upstream)`
+
+Both upstream series climb in parallel at `0.4 RPS` each — identical curves, no drift.
+
+![Round-robin Grafana view](images/exp2.png)
+![Round-robin per-upstream detail](images/exp2-2.png)
+
+---
+
+### Experiment 3 — Token-bucket rate limiter
+
+**What it tests:** Edge self-defense under aggressive burst traffic.
+
+Flooded the gateway with 150 zero-delay requests. The `RateLimiter` middleware runs before `Engine.ServeHTTP` — each IP gets its own `rate.Limiter` (10 req/s refill, burst 20). Once the bucket empties, the middleware returns `429` immediately without touching the upstream pool.
+
+```bash
+hey -n 150 -c 10 -H "Host: api.proxy" http://localhost:8080/
+```
+
+**PromQL:** `sum(rate(proxy_requests_total[1m])) by (status_code)`
+
+Downstream targets stay flat at zero. The `429` series climbs vertically, peaking above `2.0 RPS`.
+
+![Rate limiter Grafana view](images/exp3.png)
+
+---
+
+### Experiment 4 — Active health probing and zero-downtime failover
+
+**What it tests:** Background health-check goroutine, upstream eviction, and async telemetry non-blocking guarantee.
+
+Scaled the canary deployment to zero while a continuous traffic loop was running:
+
+```bash
+kubectl scale deployment payment-canary-deployment --replicas=0
+```
+
+The `startHealthCheckLoop()` goroutine polls each upstream every 5 seconds. When the canary stops responding, it is removed from the `healthy` slice. All subsequent `UpstreamPool.Next()` calls skip it — user-facing requests continue returning `200 OK` with `0 ms` added latency.
+
+**Key log line:**
+```
+level=INFO msg="Upstream detected as UNHEALTHY" upstream="http://payment-svc-canary:8001"
+```
+
+CloudWatch `PutMetricData` network timeouts appear in the background worker log — proving the telemetry goroutine blocks independently and never stalls the request path.
+
+**PromQL:** `sum(rate(proxy_requests_total[1m])) by (upstream)`
+
+The canary series drops to zero. The stable series immediately doubles to absorb the full load.
+
+![Health failover Grafana view](images/exp4.png)
+![Failover per-upstream detail](images/exp4-4.png)
+
+---
+
 ## Configuration
 
 `config.yaml` (or the `proxy-config` ConfigMap under Kubernetes):
